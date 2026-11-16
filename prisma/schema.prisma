@@ -1,0 +1,754 @@
+// Digital Office — skema database (PRD bab 11)
+// MySQL 8.x, snake_case, PK bigint auto-increment, soft delete via deleted_at
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ───────────────────────── Users & Organization ─────────────────────────
+
+enum UserStatus {
+  active
+  disabled
+}
+
+enum DepartmentKind {
+  department
+  division
+  unit
+}
+
+model User {
+  id            BigInt     @id @default(autoincrement())
+  fullName      String     @map("full_name") @db.VarChar(150)
+  email         String     @unique @db.VarChar(190)
+  username      String?    @unique @db.VarChar(100) // login alternatif (mis. dari SuperApps)
+  passwordHash  String     @map("password_hash") @db.VarChar(255)
+  externalId     String?   @unique @map("external_id") @db.VarChar(64) // id_user di sistem asal
+  externalSource String?   @map("external_source") @db.VarChar(30) // mis. "superapps"
+  photoUrl      String?    @map("photo_url") @db.VarChar(500)
+  phone         String?    @db.VarChar(40)
+  position      String?    @db.VarChar(120) // jabatan
+  departmentId  BigInt?    @map("department_id")
+  status        UserStatus @default(active)
+  isSuperAdmin  Boolean    @default(false) @map("is_super_admin")
+  tokenVersion  Int        @default(0) @map("token_version") // invalidasi refresh token
+  lastLoginAt   DateTime?  @map("last_login_at")
+  createdAt     DateTime   @default(now()) @map("created_at")
+  updatedAt     DateTime   @updatedAt @map("updated_at")
+  deletedAt     DateTime?  @map("deleted_at")
+
+  department          Department?          @relation("DepartmentMembers", fields: [departmentId], references: [id], onDelete: SetNull)
+  headOf              Department[]         @relation("DepartmentHead")
+  userRoles           UserRole[]           @relation("UserRoleUser")
+  grantedRoles        UserRole[]           @relation("UserRoleGrantedBy")
+  delegationsGiven    Delegation[]         @relation("Delegator")
+  delegationsReceived Delegation[]         @relation("Delegate")
+  delegationsCreated  Delegation[]         @relation("DelegationCreator")
+  requestsCreated     Request[]            @relation("Requester")
+  requestsAssigned    Request[]            @relation("Assignee")
+  requestComments     RequestComment[]
+  requestLogs         RequestLog[]
+  folders             Folder[]
+  files               File[]
+  sharesReceived      FileShare[]          @relation("ShareToUser")
+  sharesGiven         FileShare[]          @relation("SharedBy")
+  fileAccessLogs      FileAccessLog[]
+  flowsCreated        ApprovalFlow[]
+  approvalLevels      ApprovalLevel[]
+  decisions           ApprovalDecision[]   @relation("Decider")
+  decisionsOnBehalf   ApprovalDecision[]   @relation("OnBehalfOf")
+  decisionsDelegated  ApprovalDecision[]   @relation("DelegatedTo")
+  instancesDelegated  ApprovalInstance[]
+  notifications       Notification[]
+  auditLogs           AuditLog[]
+  exportJobs          ExportJob[]
+  eDocsCreated        EDocument[]          @relation("EDocCreator")
+  eDocSignatures      EDocumentSigner[]    @relation("EDocSigner")
+  eDocLogs            EDocumentLog[]       @relation("EDocLogActor")
+
+  @@index([departmentId])
+  @@index([status])
+  @@map("users")
+}
+
+model Department {
+  id           BigInt         @id @default(autoincrement())
+  name         String         @db.VarChar(150)
+  code         String         @unique @db.VarChar(40)
+  kind         DepartmentKind @default(department)
+  parentDeptId BigInt?        @map("parent_dept_id")
+  headUserId   BigInt?        @map("head_user_id")
+  createdAt    DateTime       @default(now()) @map("created_at")
+  updatedAt    DateTime       @updatedAt @map("updated_at")
+  deletedAt    DateTime?      @map("deleted_at")
+
+  parent        Department?    @relation("DeptHierarchy", fields: [parentDeptId], references: [id], onDelete: SetNull)
+  children      Department[]   @relation("DeptHierarchy")
+  head          User?          @relation("DepartmentHead", fields: [headUserId], references: [id], onDelete: SetNull)
+  members       User[]         @relation("DepartmentMembers")
+  folders       Folder[]
+  fileShares    FileShare[]
+  approvalFlows ApprovalFlow[]
+  eDocuments    EDocument[]
+
+  @@map("departments")
+}
+
+model Role {
+  id          BigInt    @id @default(autoincrement())
+  name        String    @unique @db.VarChar(80)
+  description String?   @db.VarChar(255)
+  isSystem    Boolean   @default(false) @map("is_system")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  deletedAt   DateTime? @map("deleted_at")
+
+  userRoles       UserRole[]
+  rolePermissions RolePermission[]
+  approvalLevels  ApprovalLevel[]
+
+  @@map("roles")
+}
+
+model UserRole {
+  id        BigInt   @id @default(autoincrement())
+  userId    BigInt   @map("user_id")
+  roleId    BigInt   @map("role_id")
+  grantedBy BigInt?  @map("granted_by")
+  grantedAt DateTime @default(now()) @map("granted_at")
+
+  user    User  @relation("UserRoleUser", fields: [userId], references: [id], onDelete: Cascade)
+  role    Role  @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  granter User? @relation("UserRoleGrantedBy", fields: [grantedBy], references: [id], onDelete: SetNull)
+
+  @@unique([userId, roleId])
+  @@map("user_roles")
+}
+
+model Permission {
+  id          BigInt  @id @default(autoincrement())
+  code        String  @unique @db.VarChar(80)
+  module      String  @db.VarChar(40)
+  description String? @db.VarChar(255)
+
+  rolePermissions RolePermission[]
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  id           BigInt @id @default(autoincrement())
+  roleId       BigInt @map("role_id")
+  permissionId BigInt @map("permission_id")
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@unique([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+enum DelegationStatus {
+  active
+  ended
+  expired
+}
+
+model Delegation {
+  id              BigInt           @id @default(autoincrement())
+  delegatorUserId BigInt           @map("delegator_user_id")
+  delegateUserId  BigInt           @map("delegate_user_id")
+  fromDate        DateTime         @map("from_date")
+  toDate          DateTime         @map("to_date")
+  reason          String?          @db.VarChar(255)
+  status          DelegationStatus @default(active)
+  createdBy       BigInt?          @map("created_by")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+  deletedAt       DateTime?        @map("deleted_at")
+
+  delegator User  @relation("Delegator", fields: [delegatorUserId], references: [id], onDelete: Restrict)
+  delegate  User  @relation("Delegate", fields: [delegateUserId], references: [id], onDelete: Restrict)
+  creator   User? @relation("DelegationCreator", fields: [createdBy], references: [id], onDelete: SetNull)
+
+  @@index([delegateUserId, status])
+  @@index([delegatorUserId, status])
+  @@map("delegations")
+}
+
+// ───────────────────────── Workflow & Request ─────────────────────────
+
+model RequestType {
+  id               BigInt    @id @default(autoincrement())
+  name             String    @db.VarChar(120)
+  code             String    @unique @db.VarChar(40)
+  description      String?   @db.VarChar(255)
+  category         String    @default("pengajuan") @db.VarChar(30) // tugas | pengajuan | follow-up
+  customFieldsJson Json?     @map("custom_fields_json")
+  enabled          Boolean   @default(true)
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+  deletedAt        DateTime? @map("deleted_at")
+
+  requests      Request[]
+  approvalFlows ApprovalFlow[]
+
+  @@map("request_types")
+}
+
+enum Priority {
+  low
+  med
+  high
+  crit
+}
+
+enum RequestStatus {
+  draft
+  submitted
+  in_progress      @map("in-progress")
+  pending_approval @map("pending-approval")
+  approved
+  rejected
+  closed
+}
+
+model Request {
+  id               BigInt        @id @default(autoincrement())
+  refCode          String        @unique @map("ref_code") @db.VarChar(40)
+  title            String        @db.VarChar(200)
+  description      String?       @db.Text
+  typeId           BigInt        @map("type_id")
+  requesterUserId  BigInt        @map("requester_user_id")
+  assigneeUserId   BigInt?       @map("assignee_user_id")
+  departmentId     BigInt?       @map("department_id") // snapshot unit pengaju
+  priority         Priority      @default(med)
+  amount           Decimal?      @db.Decimal(18, 2) // nilai untuk threshold
+  customValuesJson Json?         @map("custom_values_json")
+  dueDate          DateTime?     @map("due_date")
+  status           RequestStatus @default(draft)
+  submittedAt      DateTime?     @map("submitted_at")
+  closedAt         DateTime?     @map("closed_at")
+  lastRemindedAt   DateTime?     @map("last_reminded_at")
+  createdAt        DateTime      @default(now()) @map("created_at")
+  updatedAt        DateTime      @updatedAt @map("updated_at")
+  deletedAt        DateTime?     @map("deleted_at")
+
+  type          RequestType         @relation(fields: [typeId], references: [id], onDelete: Restrict)
+  requester     User                @relation("Requester", fields: [requesterUserId], references: [id], onDelete: Restrict)
+  assignee      User?               @relation("Assignee", fields: [assigneeUserId], references: [id], onDelete: SetNull)
+  attachments   RequestAttachment[]
+  comments      RequestComment[]
+  logs          RequestLog[]
+  instances     ApprovalInstance[]
+  notifications Notification[]
+
+  @@index([status])
+  @@index([requesterUserId])
+  @@index([assigneeUserId])
+  @@index([departmentId])
+  @@index([priority, dueDate])
+  @@index([createdAt])
+  @@map("requests")
+}
+
+model RequestAttachment {
+  id        BigInt   @id @default(autoincrement())
+  requestId BigInt   @map("request_id")
+  fileId    BigInt   @map("file_id")
+  caption   String?  @db.VarChar(255)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  request Request @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  file    File    @relation(fields: [fileId], references: [id], onDelete: Restrict)
+
+  @@unique([requestId, fileId])
+  @@map("request_attachments")
+}
+
+model RequestComment {
+  id        BigInt    @id @default(autoincrement())
+  requestId BigInt    @map("request_id")
+  userId    BigInt    @map("user_id")
+  body      String    @db.Text
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  request Request @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([requestId])
+  @@map("request_comments")
+}
+
+model RequestLog {
+  id          BigInt   @id @default(autoincrement())
+  requestId   BigInt   @map("request_id")
+  actorUserId BigInt?  @map("actor_user_id")
+  action      String   @db.VarChar(40) // created/submitted/approved/rejected/delegated/commented/...
+  fromStatus  String?  @map("from_status") @db.VarChar(30)
+  toStatus    String?  @map("to_status") @db.VarChar(30)
+  comment     String?  @db.Text
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  request Request @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  actor   User?   @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([requestId, createdAt])
+  @@map("request_logs")
+}
+
+// ───────────────────────── Document Management ─────────────────────────
+
+model Folder {
+  id             BigInt    @id @default(autoincrement())
+  name           String    @db.VarChar(150)
+  parentFolderId BigInt?   @map("parent_folder_id")
+  departmentId   BigInt?   @map("department_id")
+  isSystem       Boolean   @default(false) @map("is_system")
+  createdBy      BigInt?   @map("created_by")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  deletedAt      DateTime? @map("deleted_at")
+
+  parent     Folder?     @relation("FolderHierarchy", fields: [parentFolderId], references: [id], onDelete: Restrict)
+  children   Folder[]    @relation("FolderHierarchy")
+  department Department? @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  creator    User?       @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  files      File[]
+
+  @@index([parentFolderId])
+  @@map("folders")
+}
+
+model FileTag {
+  id        BigInt   @id @default(autoincrement())
+  name      String   @unique @db.VarChar(60)
+  color     String   @default("#075F78") @db.VarChar(20)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  taggings FileTagging[]
+
+  @@map("file_tags")
+}
+
+model File {
+  id             BigInt    @id @default(autoincrement())
+  docUid         String    @map("doc_uid") @db.VarChar(36) // satu dokumen = banyak versi
+  folderId       BigInt    @map("folder_id")
+  userId         BigInt    @map("user_id") // uploader
+  originalName   String    @map("original_name") @db.VarChar(255)
+  title          String?   @db.VarChar(255)
+  description    String?   @db.Text
+  category       String?   @db.VarChar(80)
+  metadataJson   Json?     @map("metadata_json")
+  mimeType       String    @map("mime_type") @db.VarChar(150)
+  sizeBytes      BigInt    @map("size_bytes")
+  storagePath    String    @map("storage_path") @db.VarChar(500)
+  checksumSha256 String    @map("checksum_sha256") @db.Char(64)
+  version        Int       @default(1)
+  isActive       Boolean   @default(true) @map("is_active") // versi terbaru
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+  deletedAt      DateTime? @map("deleted_at")
+
+  folder      Folder              @relation(fields: [folderId], references: [id], onDelete: Restrict)
+  uploader    User                @relation(fields: [userId], references: [id], onDelete: Restrict)
+  taggings    FileTagging[]
+  shares      FileShare[]
+  accessLogs  FileAccessLog[]
+  attachments RequestAttachment[]
+  eDocuments  EDocument[]
+
+  @@unique([docUid, version])
+  @@index([folderId, isActive])
+  @@index([originalName])
+  @@index([category])
+  @@index([mimeType])
+  @@map("files")
+}
+
+model FileTagging {
+  id     BigInt @id @default(autoincrement())
+  fileId BigInt @map("file_id")
+  tagId  BigInt @map("tag_id")
+
+  file File    @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  tag  FileTag @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@unique([fileId, tagId])
+  @@index([tagId])
+  @@map("file_taggings")
+}
+
+enum AccessLevel {
+  read
+  comment
+  write
+}
+
+model FileShare {
+  id            BigInt      @id @default(autoincrement())
+  fileId        BigInt      @map("file_id")
+  shareToUserId BigInt?     @map("share_to_user_id")
+  shareToDeptId BigInt?     @map("share_to_dept_id")
+  accessLevel   AccessLevel @default(read) @map("access_level")
+  sharedBy      BigInt      @map("shared_by")
+  expiresAt     DateTime?   @map("expires_at")
+  createdAt     DateTime    @default(now()) @map("created_at")
+
+  file       File        @relation(fields: [fileId], references: [id], onDelete: Cascade)
+  toUser     User?       @relation("ShareToUser", fields: [shareToUserId], references: [id], onDelete: Cascade)
+  toDept     Department? @relation(fields: [shareToDeptId], references: [id], onDelete: Cascade)
+  sharedByMe User        @relation("SharedBy", fields: [sharedBy], references: [id], onDelete: Restrict)
+
+  @@index([shareToUserId])
+  @@index([shareToDeptId])
+  @@map("file_shares")
+}
+
+enum FileAccessAction {
+  viewed
+  downloaded
+  shared
+  uploaded
+  deleted
+}
+
+model FileAccessLog {
+  id        BigInt           @id @default(autoincrement())
+  fileId    BigInt           @map("file_id")
+  userId    BigInt           @map("user_id")
+  action    FileAccessAction
+  ipAddress String?          @map("ip_address") @db.VarChar(64)
+  createdAt DateTime         @default(now()) @map("created_at")
+
+  file File @relation(fields: [fileId], references: [id], onDelete: Restrict)
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([fileId, createdAt])
+  @@index([createdAt])
+  @@map("file_access_logs")
+}
+
+// ───────────────────────── Approval ─────────────────────────
+
+enum FlowStatus {
+  draft
+  active
+  archived
+}
+
+enum ApproverType {
+  user      // user spesifik
+  role      // siapa pun dengan role tsb (opsional dibatasi departemen pengaju)
+  dept_head // kepala departemen pengaju
+}
+
+model ApprovalFlow {
+  id                BigInt     @id @default(autoincrement())
+  name              String     @db.VarChar(150)
+  code              String     @unique @db.VarChar(60)
+  description       String?    @db.VarChar(255)
+  departmentId      BigInt?    @map("department_id") // null = global
+  triggerTypeId     BigInt?    @map("trigger_type_id")
+  thresholdRuleJson Json?      @map("threshold_rule_json") // {"min_priority":"high","threshold_value":500000000}
+  rejectAction      String     @default("revise") @map("reject_action") @db.VarChar(20) // revise | close
+  status            FlowStatus @default(draft)
+  createdBy         BigInt?    @map("created_by")
+  createdAt         DateTime   @default(now()) @map("created_at")
+  updatedAt         DateTime   @updatedAt @map("updated_at")
+  deletedAt         DateTime?  @map("deleted_at")
+
+  department  Department?        @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  triggerType RequestType?       @relation(fields: [triggerTypeId], references: [id], onDelete: SetNull)
+  creator     User?              @relation(fields: [createdBy], references: [id], onDelete: SetNull)
+  levels      ApprovalLevel[]
+  instances   ApprovalInstance[]
+
+  @@index([status])
+  @@map("approval_flows")
+}
+
+model ApprovalLevel {
+  id             BigInt       @id @default(autoincrement())
+  flowId         BigInt       @map("flow_id")
+  levelOrder     Int          @map("level_order")
+  name           String       @db.VarChar(120)
+  approverType   ApproverType @default(role) @map("approver_type")
+  approverRoleId BigInt?      @map("approver_role_id")
+  approverUserId BigInt?      @map("approver_user_id")
+  sameDeptOnly   Boolean      @default(true) @map("same_dept_only")
+  delegateOn     Boolean      @default(true) @map("delegate_on")
+  slaHours       Int          @default(24) @map("sla_hours")
+  conditionJson  Json?        @map("condition_json") // kondisi branch, mis. {"min_priority":"high"}
+
+  flow         ApprovalFlow @relation(fields: [flowId], references: [id], onDelete: Cascade)
+  approverRole Role?        @relation(fields: [approverRoleId], references: [id], onDelete: SetNull)
+  approverUser User?        @relation(fields: [approverUserId], references: [id], onDelete: SetNull)
+
+  @@unique([flowId, levelOrder])
+  @@map("approval_levels")
+}
+
+enum InstanceStatus {
+  pending
+  in_progress @map("in-progress")
+  approved
+  rejected
+}
+
+model ApprovalInstance {
+  id                    BigInt         @id @default(autoincrement())
+  requestId             BigInt         @map("request_id")
+  flowId                BigInt         @map("flow_id")
+  currentLevel          Int            @map("current_level")
+  planJson              Json           @map("plan_json") // urutan level_order yang berlaku utk request ini
+  currentDelegateUserId BigInt?        @map("current_delegate_user_id")
+  levelStartedAt        DateTime       @default(now()) @map("level_started_at")
+  status                InstanceStatus @default(pending)
+  startedAt             DateTime       @default(now()) @map("started_at")
+  finishedAt            DateTime?      @map("finished_at")
+  createdAt             DateTime       @default(now()) @map("created_at")
+  updatedAt             DateTime       @updatedAt @map("updated_at")
+
+  request         Request            @relation(fields: [requestId], references: [id], onDelete: Restrict)
+  flow            ApprovalFlow       @relation(fields: [flowId], references: [id], onDelete: Restrict)
+  currentDelegate User?              @relation(fields: [currentDelegateUserId], references: [id], onDelete: SetNull)
+  decisions       ApprovalDecision[]
+
+  @@index([status])
+  @@index([requestId])
+  @@map("approval_instances")
+}
+
+enum Decision {
+  approve
+  reject
+  delegate
+}
+
+model ApprovalDecision {
+  id               BigInt   @id @default(autoincrement())
+  instanceId       BigInt   @map("instance_id")
+  levelOrder       Int      @map("level_order")
+  approverUserId   BigInt   @map("approver_user_id") // yang memutuskan (delegat bila via delegasi)
+  onBehalfOfUserId BigInt?  @map("on_behalf_of_user_id") // delegator
+  decision         Decision
+  comment          String?  @db.Text
+  decidedAt        DateTime @default(now()) @map("decided_at")
+  delegatedToUserId BigInt? @map("delegated_to")
+
+  instance    ApprovalInstance @relation(fields: [instanceId], references: [id], onDelete: Restrict)
+  approver    User             @relation("Decider", fields: [approverUserId], references: [id], onDelete: Restrict)
+  onBehalfOf  User?            @relation("OnBehalfOf", fields: [onBehalfOfUserId], references: [id], onDelete: SetNull)
+  delegatedToUser User?        @relation("DelegatedTo", fields: [delegatedToUserId], references: [id], onDelete: SetNull)
+
+  @@index([instanceId, levelOrder])
+  @@index([decidedAt])
+  @@map("approval_decisions")
+}
+
+// ───────────────────────── Notifikasi & Audit ─────────────────────────
+
+enum NotificationStatus {
+  pending
+  sent
+  failed
+}
+
+model Notification {
+  id        BigInt             @id @default(autoincrement())
+  userId    BigInt             @map("user_id")
+  requestId BigInt?            @map("request_id")
+  eventType String             @map("event_type") @db.VarChar(40)
+  subject   String             @db.VarChar(255)
+  body      String             @db.Text
+  status    NotificationStatus @default(pending)
+  attempts  Int                @default(0)
+  sentAt    DateTime?          @map("sent_at")
+  readAt    DateTime?          @map("read_at")
+  error     String?            @db.Text
+  createdAt DateTime           @default(now()) @map("created_at")
+  updatedAt DateTime           @updatedAt @map("updated_at")
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  request Request? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([status])
+  @@map("notifications")
+}
+
+model NotificationTemplate {
+  id          BigInt   @id @default(autoincrement())
+  eventType   String   @unique @map("event_type") @db.VarChar(40)
+  name        String   @db.VarChar(120)
+  subject     String   @db.VarChar(255)
+  body        String   @db.Text // placeholder {{nama}}, {{ref}}, {{judul}}, ...
+  enabled     Boolean  @default(true)
+  minPriority Priority @default(low) @map("min_priority") // threshold
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("notification_templates")
+}
+
+model AuditLog {
+  id          BigInt   @id @default(autoincrement())
+  actorUserId BigInt?  @map("actor_user_id")
+  module      String   @db.VarChar(40)
+  action      String   @db.VarChar(60)
+  entityType  String?  @map("entity_type") @db.VarChar(60)
+  entityId    String?  @map("entity_id") @db.VarChar(60)
+  payloadJson Json?    @map("payload_json")
+  ipAddress   String?  @map("ip_address") @db.VarChar(64)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  actor User? @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([module, createdAt])
+  @@index([actorUserId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model ExportJob {
+  id          BigInt   @id @default(autoincrement())
+  userId      BigInt   @map("user_id")
+  module      String   @db.VarChar(40)
+  format      String   @db.VarChar(10) // xlsx | pdf
+  filtersJson Json?    @map("filters_json")
+  filePath    String?  @map("file_path") @db.VarChar(500)
+  rowCount    Int      @default(0) @map("row_count")
+  status      String   @default("done") @db.VarChar(20)
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId, createdAt])
+  @@map("export_jobs")
+}
+
+// ───────────────────────── Naskah Dinas (dokumen dibuat di aplikasi + tanda tangan QR) ─────────────────────────
+
+enum EDocStatus {
+  draft
+  signing
+  signed
+  rejected
+  cancelled
+}
+
+enum SignerRole {
+  paraf // pemeriksa / paraf
+  sign  // penanda tangan
+}
+
+enum SignerStatus {
+  waiting // belum giliran
+  pending // giliran saat ini
+  signed
+  rejected
+}
+
+model DocTemplate {
+  id           BigInt    @id @default(autoincrement())
+  name         String    @db.VarChar(150)
+  code         String    @unique @db.VarChar(30)
+  category     String    @default("Surat") @db.VarChar(60)
+  description  String?   @db.VarChar(255)
+  bodyHtml     String    @map("body_html") @db.MediumText
+  numberFormat String    @default("{seq}/{code}/{dept}/{month_roman}/{year}") @map("number_format") @db.VarChar(120)
+  enabled      Boolean   @default(true)
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  deletedAt    DateTime? @map("deleted_at")
+
+  documents EDocument[]
+
+  @@map("doc_templates")
+}
+
+model EDocument {
+  id             BigInt     @id @default(autoincrement())
+  number         String?    @unique @db.VarChar(120) // nomor surat, terbit saat dikirim
+  seq            Int?
+  title          String     @db.VarChar(200)
+  subject        String?    @db.VarChar(255) // perihal
+  recipient      String?    @db.Text // kepada
+  attachmentNote String?    @map("attachment_note") @db.VarChar(255) // lampiran
+  place          String     @default("Jakarta") @db.VarChar(80)
+  docDate        DateTime?  @map("doc_date")
+  bodyHtml       String     @map("body_html") @db.MediumText
+  contentHash    String?    @map("content_hash") @db.Char(64) // SHA-256 isi final
+  status         EDocStatus @default(draft)
+  templateId     BigInt?    @map("template_id")
+  departmentId   BigInt?    @map("department_id")
+  creatorUserId  BigInt     @map("creator_user_id")
+  fileId         BigInt?    @map("file_id") // PDF final di Document Management
+  submittedAt    DateTime?  @map("submitted_at")
+  completedAt    DateTime?  @map("completed_at")
+  createdAt      DateTime   @default(now()) @map("created_at")
+  updatedAt      DateTime   @updatedAt @map("updated_at")
+  deletedAt      DateTime?  @map("deleted_at")
+
+  template   DocTemplate?      @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  department Department?       @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  creator    User              @relation("EDocCreator", fields: [creatorUserId], references: [id], onDelete: Restrict)
+  file       File?             @relation(fields: [fileId], references: [id], onDelete: SetNull)
+  signers    EDocumentSigner[]
+  logs       EDocumentLog[]
+
+  @@index([status])
+  @@index([creatorUserId])
+  @@index([templateId, seq])
+  @@map("e_documents")
+}
+
+model EDocumentSigner {
+  id            BigInt       @id @default(autoincrement())
+  documentId    BigInt       @map("document_id")
+  userId        BigInt       @map("user_id")
+  order         Int          @map("sign_order")
+  role          SignerRole   @default(sign)
+  status        SignerStatus @default(waiting)
+  positionTitle String?      @map("position_title") @db.VarChar(150) // jabatan saat menandatangani
+  token         String?      @unique @db.VarChar(64) // isi QR → /verify/{token}
+  signatureHmac String?      @map("signature_hmac") @db.Char(64)
+  contentHash   String?      @map("content_hash") @db.Char(64)
+  signedAt      DateTime?    @map("signed_at")
+  comment       String?      @db.Text
+  ipAddress     String?      @map("ip_address") @db.VarChar(64)
+  verifyCount   Int          @default(0) @map("verify_count")
+  createdAt     DateTime     @default(now()) @map("created_at")
+
+  document EDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  user     User      @relation("EDocSigner", fields: [userId], references: [id], onDelete: Restrict)
+
+  @@unique([documentId, order])
+  @@index([userId, status])
+  @@map("e_document_signers")
+}
+
+model EDocumentLog {
+  id          BigInt   @id @default(autoincrement())
+  documentId  BigInt   @map("document_id")
+  actorUserId BigInt?  @map("actor_user_id")
+  action      String   @db.VarChar(40)
+  comment     String?  @db.Text
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  document EDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  actor    User?     @relation("EDocLogActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([documentId, createdAt])
+  @@map("e_document_logs")
+}
