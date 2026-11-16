@@ -248,6 +248,7 @@ model Request {
   logs          RequestLog[]
   instances     ApprovalInstance[]
   notifications Notification[]
+  eDocument     EDocument? // naskah dinas yang disetujui lewat request ini
 
   @@index([status])
   @@index([requesterUserId])
@@ -694,6 +695,7 @@ model EDocument {
   departmentId   BigInt?    @map("department_id")
   creatorUserId  BigInt     @map("creator_user_id")
   fileId         BigInt?    @map("file_id") // PDF final di Document Management
+  requestId      BigInt?    @unique @map("request_id") // request approval yang menjadi jalur paraf/tanda tangan
   submittedAt    DateTime?  @map("submitted_at")
   completedAt    DateTime?  @map("completed_at")
   createdAt      DateTime   @default(now()) @map("created_at")
@@ -704,6 +706,7 @@ model EDocument {
   department Department?       @relation(fields: [departmentId], references: [id], onDelete: SetNull)
   creator    User              @relation("EDocCreator", fields: [creatorUserId], references: [id], onDelete: Restrict)
   file       File?             @relation(fields: [fileId], references: [id], onDelete: SetNull)
+  request    Request?          @relation(fields: [requestId], references: [id], onDelete: SetNull)
   signers    EDocumentSigner[]
   logs       EDocumentLog[]
 
@@ -721,6 +724,8 @@ model EDocumentSigner {
   role          SignerRole   @default(sign)
   status        SignerStatus @default(waiting)
   positionTitle String?      @map("position_title") @db.VarChar(150) // jabatan saat menandatangani
+  levelName     String?      @map("level_name") @db.VarChar(120) // level approval asal (naskah via request)
+  onBehalfOf    String?      @map("on_behalf_of") @db.VarChar(150) // a.n. — bila disetujui oleh delegat
   token         String?      @unique @db.VarChar(64) // isi QR → /verify/{token}
   signatureHmac String?      @map("signature_hmac") @db.Char(64)
   contentHash   String?      @map("content_hash") @db.Char(64)

@@ -1,6 +1,6 @@
-import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, Logger, NotFoundException, OnModuleInit, UnauthorizedException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Prisma, SignerRole } from '@prisma/client';
+import { Prisma, Priority, SignerRole } from '@prisma/client';
 import * as bcrypt from 'bcryptjs';
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto';
 import { PrismaService } from '../prisma/prisma.service';
@@ -10,13 +10,22 @@ import { DocumentsService } from '../documents/documents.service';
 import { AuthUser } from '../common/types';
 import { can, pageParams, paginated } from '../common/utils';
 import { fillPlaceholders, htmlToText, sanitizeHtml } from './html';
-import { EDocPdfService, fmtLongDate } from './e-doc-pdf.service';
+import { EDocPdfService, fmtLongDate, PdfSigner } from './e-doc-pdf.service';
+import { ApprovalHook, ApprovalsService, DecisionContext, PlanLevel } from '../approvals/approvals.service';
+import { NASKAH_CATEGORY, RequestsService } from '../requests/requests.service';
+
+/** Kode tipe request yang menjadi jalur approval naskah dinas. */
+export const NASKAH_TYPE_CODE = 'NSK';
+type Tx = Prisma.TransactionClient;
 
 export interface SignerInput { userId: string; role: 'sign' | 'paraf' }
 export interface EDocInput {
   title: string; subject?: string; recipient?: string; attachmentNote?: string; place?: string; docDate?: string;
-  bodyHtml: string; templateId?: string | null; signers?: SignerInput[];
+  bodyHtml: string; templateId?: string | null;
+  /** @deprecated paraf/tanda tangan kini mengikuti alur approval request; diabaikan. */
+  signers?: SignerInput[];
 }
+export interface SubmitInput { priority?: Priority; dueDate?: string | null }
 
 const ROMAN = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII'];
 const ROLE_LABEL: Record<SignerRole, string> = { sign: 'tanda tangan', paraf: 'paraf' };
@@ -31,12 +40,26 @@ const detailInclude = {
     include: { user: { select: { id: true, fullName: true, position: true, photoUrl: true, email: true } } },
   },
   logs: { orderBy: { createdAt: 'asc' }, include: { actor: { select: { id: true, fullName: true } } } },
+  request: {
+    select: {
+      id: true, refCode: true, status: true, priority: true, dueDate: true, requesterUserId: true, assigneeUserId: true, departmentId: true, deletedAt: true,
+      instances: { orderBy: { id: 'desc' }, take: 1, select: { id: true, status: true } },
+    },
+  },
 } satisfies Prisma.EDocumentInclude;
 
 type DocFull = Prisma.EDocumentGetPayload<{ include: typeof detailInclude }>;
 
+/**
+ * Naskah dinas. Sejak v1.1 paraf & tanda tangan mengikuti ALUR APPROVAL REQUEST:
+ * naskah dikirim → request tipe "Naskah Dinas" dibuat & masuk approval → setiap level yang menyetujui
+ * (dengan kata sandi) langsung mendapat QR paraf, level terakhir QR tanda tangan → PDF final.
+ * Alur lama (daftar penanda tangan manual) tetap dilayani untuk naskah yang sudah berjalan sebelum pembaruan.
+ */
 @Injectable()
-export class EDocumentsService {
+export class EDocumentsService implements OnModuleInit, ApprovalHook {
+  private readonly logger = new Logger('Naskah');
+
   constructor(
     private prisma: PrismaService,
     private audit: AuditService,
@@ -44,7 +67,56 @@ export class EDocumentsService {
     private docs: DocumentsService,
     private pdf: EDocPdfService,
     private config: ConfigService,
+    private approvals: ApprovalsService,
+    private requests: RequestsService,
   ) {}
+
+  onModuleInit() {
+    this.approvals.registerHook(this);
+    this.naskahType().catch((e) => this.logger.warn(`Gagal menyiapkan tipe request Naskah Dinas: ${(e as Error).message}`));
+  }
+
+  /** Tipe request "Naskah Dinas" (+ alur approval bawaan saat pertama kali dibuat). */
+  async naskahType() {
+    const existing = await this.prisma.requestType.findUnique({ where: { code: NASKAH_TYPE_CODE } });
+    if (existing) {
+      if (existing.deletedAt || existing.category !== NASKAH_CATEGORY) {
+        return this.prisma.requestType.update({ where: { id: existing.id }, data: { deletedAt: null, category: NASKAH_CATEGORY } });
+      }
+      return existing;
+    }
+    const type = await this.prisma.requestType.create({
+      data: {
+        name: 'Naskah Dinas', code: NASKAH_TYPE_CODE, category: NASKAH_CATEGORY, customFieldsJson: [],
+        description: 'Persetujuan, paraf & tanda tangan QR naskah dinas — dibuat dari menu Naskah dinas',
+      },
+    });
+    const hasFlow = await this.prisma.approvalFlow.count({ where: { triggerTypeId: type.id, deletedAt: null } });
+    if (!hasFlow) {
+      const direktur = await this.prisma.role.findFirst({ where: { name: 'Direktur', deletedAt: null } });
+      let code = 'NASKAH-DINAS';
+      if (await this.prisma.approvalFlow.findUnique({ where: { code } })) code = `NASKAH-DINAS-${Date.now() % 100000}`;
+      await this.prisma.approvalFlow.create({
+        data: {
+          name: 'Naskah Dinas', code, triggerTypeId: type.id, status: 'active', rejectAction: 'revise',
+          description: 'Level awal = paraf, level terakhir = tanda tangan. Ubah sesuai kebutuhan.',
+          levels: {
+            create: [
+              { levelOrder: 1, name: 'Paraf — Kepala Unit', approverType: 'dept_head', slaHours: 24 },
+              ...(direktur ? [{ levelOrder: 2, name: 'Tanda tangan — Direktur', approverType: 'role' as const, approverRoleId: direktur.id, sameDeptOnly: false, slaHours: 48 }] : []),
+            ],
+          },
+        },
+      });
+      this.logger.log('Tipe request & alur approval "Naskah Dinas" dibuat');
+    }
+    return type;
+  }
+
+  /** Naskah lama: penanda tangan dipilih manual (sebelum terhubung ke approval request). */
+  private isLegacy(d: { requestId: bigint | null; status: string }) {
+    return !d.requestId && (d.status === 'signing' || d.status === 'signed');
+  }
 
   get org() { return this.pdf.org; }
 
@@ -54,13 +126,21 @@ export class EDocumentsService {
 
   // ───────── Akses ─────────
 
-  private visibleWhere(user: AuthUser): Prisma.EDocumentWhereInput {
+  /** Naskah yang menunggu persetujuan user ini di inbox approval. */
+  private async awaitingMyApproval(user: AuthUser): Promise<bigint[]> {
+    const items = await this.approvals.inbox(user);
+    return items.filter((i) => i.eDocument).map((i) => i.eDocument!.id);
+  }
+
+  private visibleWhere(user: AuthUser, awaiting: bigint[] = []): Prisma.EDocumentWhereInput {
     if (user.isSuperAdmin || can(user, 'EDOC_VIEW_ALL')) return {};
     const or: Prisma.EDocumentWhereInput[] = [
       { creatorUserId: user.id },
-      // penanda tangan melihat naskah setelah dikirim (bukan draft pembuat)
+      // penanda tangan / approver melihat naskah setelah dikirim (bukan draft pembuat)
       { signers: { some: { userId: user.id } }, status: { not: 'draft' } },
+      { request: { instances: { some: { decisions: { some: { approverUserId: user.id } } } } }, status: { not: 'draft' } },
     ];
+    if (awaiting.length) or.push({ id: { in: awaiting } });
     if (can(user, 'DOC_MANAGE') && user.departmentId) or.push({ departmentId: user.departmentId, status: { not: 'draft' } });
     return { OR: or };
   }
@@ -71,10 +151,13 @@ export class EDocumentsService {
     return d;
   }
 
-  private canView(user: AuthUser, d: DocFull) {
+  private async canView(user: AuthUser, d: DocFull) {
     if (user.isSuperAdmin || can(user, 'EDOC_VIEW_ALL') || d.creatorUserId === user.id) return true;
-    if (d.status !== 'draft' && d.signers.some((s) => s.userId === user.id)) return true;
-    return can(user, 'DOC_MANAGE') && !!user.departmentId && d.departmentId === user.departmentId && d.status !== 'draft';
+    if (d.status === 'draft') return false;
+    if (d.signers.some((s) => s.userId === user.id)) return true;
+    if (can(user, 'DOC_MANAGE') && !!user.departmentId && d.departmentId === user.departmentId) return true;
+    // approver (saat ini / sebelumnya), penanggung jawab, atau unit yang boleh melihat request-nya
+    return !!d.request && !d.request.deletedAt && (await this.requests.canView(user, d.request));
   }
 
   private async log(documentId: bigint, actorUserId: bigint | null, action: string, comment?: string | null, tx?: Prisma.TransactionClient) {
@@ -109,7 +192,9 @@ export class EDocumentsService {
     const payload = JSON.stringify({
       number: d.number, title: d.title, subject: d.subject, recipient: d.recipient, attachmentNote: d.attachmentNote,
       place: d.place, docDate: d.docDate?.toISOString().slice(0, 10) ?? null, body: this.renderedBody(d),
-      signers: d.signers.map((s) => ({ u: s.userId.toString(), r: s.role, o: s.order })),
+      // naskah lama: daftar penanda tangan ditetapkan sebelum dikirim → ikut di-hash.
+      // naskah via approval: penanda tangan baru diketahui saat tiap level menyetujui → diikat lewat HMAC per QR.
+      ...(d.requestId ? {} : { signers: d.signers.map((s) => ({ u: s.userId.toString(), r: s.role, o: s.order })) }),
     });
     return createHash('sha256').update(payload).digest('hex');
   }
@@ -122,9 +207,12 @@ export class EDocumentsService {
 
   async list(user: AuthUser, q: Record<string, string>) {
     const { page, perPage, skip, take } = pageParams(q);
-    const and: Prisma.EDocumentWhereInput[] = [{ deletedAt: null }, this.visibleWhere(user)];
+    const awaiting = await this.awaitingMyApproval(user);
+    const and: Prisma.EDocumentWhereInput[] = [{ deletedAt: null }, this.visibleWhere(user, awaiting)];
     if (q.scope === 'mine') and.push({ creatorUserId: user.id });
-    if (q.scope === 'tosign') and.push({ status: 'signing', signers: { some: { userId: user.id, status: 'pending' } } });
+    if (q.scope === 'tosign') {
+      and.push({ OR: [{ id: { in: awaiting } }, { requestId: null, status: 'signing', signers: { some: { userId: user.id, status: 'pending' } } }] });
+    }
     if (q.scope === 'signed-by-me') and.push({ signers: { some: { userId: user.id, status: 'signed' } } });
     if (q.status) and.push({ status: q.status as any });
     if (q.search) and.push({ OR: [{ title: { contains: q.search } }, { number: { contains: q.search } }, { subject: { contains: q.search } }] });
@@ -134,6 +222,7 @@ export class EDocumentsService {
         where, skip, take, orderBy: { updatedAt: 'desc' },
         select: {
           id: true, number: true, title: true, subject: true, status: true, createdAt: true, updatedAt: true, submittedAt: true, completedAt: true,
+          request: { select: { id: true, refCode: true, status: true } },
           template: { select: { name: true, category: true } }, creator: { select: { id: true, fullName: true, photoUrl: true } },
           signers: { orderBy: { order: 'asc' }, select: { order: true, role: true, status: true, user: { select: { id: true, fullName: true } } } },
         },
@@ -143,26 +232,36 @@ export class EDocumentsService {
     return paginated(rows, total, page, perPage);
   }
 
-  countToSign(user: AuthUser) {
-    return this.prisma.eDocument.count({ where: { deletedAt: null, status: 'signing', signers: { some: { userId: user.id, status: 'pending' } } } });
+  async countToSign(user: AuthUser) {
+    const legacy = await this.prisma.eDocument.count({ where: { deletedAt: null, requestId: null, status: 'signing', signers: { some: { userId: user.id, status: 'pending' } } } });
+    return legacy + (await this.awaitingMyApproval(user)).length;
   }
 
   // ───────── Detail ─────────
 
   async detail(user: AuthUser, id: bigint) {
     const d = await this.load(id);
-    if (!this.canView(user, d)) {
+    if (!(await this.canView(user, d))) {
       await this.audit.log({ actorUserId: user.id, module: 'security', action: 'access_denied', entityType: 'e_document', entityId: id });
       throw new ForbiddenException('Anda tidak memiliki akses ke naskah ini');
     }
-    const signers = await Promise.all(d.signers.map(async (s) => ({
+    const legacy = this.isLegacy(d);
+    // naskah via approval: tampilkan QR putaran yang sedang berjalan/selesai (bukan sisa putaran yang ditolak)
+    const rows = legacy || d.status === 'signing' || d.status === 'signed' ? d.signers : d.signers.filter((s) => s.status === 'signed');
+    const signers = await Promise.all(rows.map(async (s) => ({
       id: s.id, order: s.order, role: s.role, status: s.status, positionTitle: s.positionTitle ?? s.user.position, signedAt: s.signedAt,
+      levelName: s.levelName, onBehalfOf: s.onBehalfOf,
       comment: s.comment, user: s.user, verifyUrl: s.token && s.status === 'signed' ? this.pdf.verifyUrl(s.token) : null,
       qrDataUrl: s.token && s.status === 'signed' ? await this.pdf.qrDataUrl(s.token) : null,
     })));
     const mine = d.signers.find((s) => s.userId === user.id);
     const isCreator = d.creatorUserId === user.id;
     const intact = d.status !== 'signed' || !d.contentHash || this.hashContent(d) === d.contentHash;
+    const inst = d.request && !d.request.deletedAt ? d.request.instances[0] : undefined;
+    const approval = inst ? await this.approvals.detail(inst.id) : null;
+    const current = approval?.status === 'in_progress' ? approval.levels.find((l) => l.state === 'current') : undefined;
+    const myTurn = !!current?.currentApprovers.some((a) => a.id === user.id) && can(user, 'APPROVAL_DECIDE') && d.status === 'signing';
+    const levelIdx = current ? approval!.levels.indexOf(current) : -1;
     return {
       id: d.id, number: d.number, title: d.title, subject: d.subject, recipient: d.recipient, attachmentNote: d.attachmentNote,
       place: d.place, docDate: d.docDate, status: d.status, contentHash: d.contentHash, intact,
@@ -170,32 +269,34 @@ export class EDocumentsService {
       template: d.template, department: d.department, creator: d.creator, file: d.file,
       submittedAt: d.submittedAt, completedAt: d.completedAt, createdAt: d.createdAt, updatedAt: d.updatedAt,
       signers, logs: d.logs, org: this.pdf.org,
+      legacy,
+      request: d.request && !d.request.deletedAt
+        ? { id: d.request.id, refCode: d.request.refCode, status: d.request.status, statusCode: d.request.status.replace('_', '-'), priority: d.request.priority, dueDate: d.request.dueDate }
+        : null,
+      approval,
+      plannedSigners: d.status === 'signed' ? [] : await this.plannedSigners(d),
       permissions: {
         canEdit: isCreator && ['draft', 'rejected'].includes(d.status) && can(user, 'EDOC_CREATE'),
         canSubmit: isCreator && ['draft', 'rejected'].includes(d.status) && can(user, 'EDOC_CREATE'),
-        canCancel: isCreator && d.status === 'signing',
+        canCancel: legacy && isCreator && d.status === 'signing',
         canDelete: isCreator && d.status === 'draft',
-        canSign: d.status === 'signing' && mine?.status === 'pending',
-        myRole: mine?.role ?? null,
+        // naskah lama: tanda tangan manual
+        canSign: legacy && d.status === 'signing' && mine?.status === 'pending',
+        // naskah via approval: setujui (paraf/tanda tangan) atau tolak di level saat ini
+        canDecide: myTurn,
+        canDelegate: myTurn && !!current?.delegateOn,
+        instanceId: myTurn ? approval!.id : null,
+        requiresPassword: true,
+        myRole: myTurn ? (levelIdx === approval!.levels.length - 1 ? 'sign' : 'paraf') : legacy ? (mine?.role ?? null) : null,
+        myLevelName: myTurn ? current!.name : null,
       },
     };
   }
 
   // ───────── Buat / ubah draft ─────────
 
-  private async validateSigners(signers: SignerInput[] | undefined, creatorId: bigint) {
-    const list = signers ?? [];
-    const ids = list.map((s) => s.userId);
-    if (new Set(ids).size !== ids.length) throw new BadRequestException('Penanda tangan tidak boleh duplikat');
-    if (list.length > 10) throw new BadRequestException('Maksimal 10 penanda tangan/paraf');
-    const users = await this.prisma.user.findMany({ where: { id: { in: ids.map((i) => BigInt(i)) }, deletedAt: null, status: 'active' }, select: { id: true } });
-    if (users.length !== ids.length) throw new BadRequestException('Ada penanda tangan yang tidak aktif atau tidak ditemukan');
-    return list.map((s, i) => ({ userId: BigInt(s.userId), role: s.role === 'paraf' ? ('paraf' as const) : ('sign' as const), order: i + 1 }));
-  }
-
   async create(user: AuthUser, dto: EDocInput) {
     if (!can(user, 'EDOC_CREATE')) throw new ForbiddenException('Peran Anda tidak dapat membuat naskah');
-    const signers = await this.validateSigners(dto.signers, user.id);
     let templateId: bigint | null = null;
     if (dto.templateId) {
       const t = await this.prisma.docTemplate.findFirst({ where: { id: BigInt(dto.templateId), deletedAt: null } });
@@ -211,7 +312,6 @@ export class EDocumentsService {
           templateId, departmentId: user.departmentId, creatorUserId: user.id,
         },
       });
-      if (signers.length) await tx.eDocumentSigner.createMany({ data: signers.map((s) => ({ ...s, documentId: doc.id })) });
       await this.log(doc.id, user.id, 'created', null, tx);
       await this.audit.log({ actorUserId: user.id, module: 'edoc', action: 'edoc_created', entityType: 'e_document', entityId: doc.id, payload: { title: doc.title } }, tx);
       return doc;
@@ -223,7 +323,6 @@ export class EDocumentsService {
     const d = await this.load(id);
     if (d.creatorUserId !== user.id) throw new ForbiddenException('Hanya pembuat yang dapat mengubah naskah');
     if (!['draft', 'rejected'].includes(d.status)) throw new BadRequestException('Naskah yang sedang/selesai ditandatangani tidak dapat diubah');
-    const signers = dto.signers ? await this.validateSigners(dto.signers, user.id) : null;
     await this.prisma.$transaction(async (tx) => {
       await tx.eDocument.update({
         where: { id },
@@ -235,10 +334,6 @@ export class EDocumentsService {
           bodyHtml: dto.bodyHtml === undefined ? undefined : sanitizeHtml(dto.bodyHtml),
         },
       });
-      if (signers) {
-        await tx.eDocumentSigner.deleteMany({ where: { documentId: id } });
-        if (signers.length) await tx.eDocumentSigner.createMany({ data: signers.map((s) => ({ ...s, documentId: id })) });
-      }
       await this.log(id, user.id, 'updated', null, tx);
     });
     return this.detail(user, id);
@@ -248,6 +343,8 @@ export class EDocumentsService {
     const d = await this.load(id);
     if (d.creatorUserId !== user.id || d.status !== 'draft') throw new ForbiddenException('Hanya draft milik Anda yang dapat dihapus');
     await this.prisma.eDocument.update({ where: { id }, data: { deletedAt: new Date() } });
+    // request draft yang terhubung (dari pengiriman yang gagal) ikut dihapus
+    if (d.requestId) await this.prisma.request.updateMany({ where: { id: d.requestId, status: 'draft' }, data: { deletedAt: new Date() } });
     await this.audit.log({ actorUserId: user.id, module: 'edoc', action: 'edoc_deleted', entityType: 'e_document', entityId: id });
     return { ok: true };
   }
@@ -284,25 +381,32 @@ export class EDocumentsService {
     return number;
   }
 
-  // ───────── Kirim untuk ditandatangani ─────────
+  // ───────── Kirim untuk approval (request "Naskah Dinas") ─────────
 
-  async submit(user: AuthUser, id: bigint, ip?: string) {
+  async submit(user: AuthUser, id: bigint, input: SubmitInput = {}, ip?: string) {
     const d = await this.load(id);
     if (d.creatorUserId !== user.id) throw new ForbiddenException('Hanya pembuat yang dapat mengirim naskah');
+    if (!can(user, 'EDOC_CREATE')) throw new ForbiddenException('Peran Anda tidak dapat mengirim naskah');
     if (!['draft', 'rejected'].includes(d.status)) throw new BadRequestException('Naskah sudah dikirim');
-    if (!d.signers.some((s) => s.role === 'sign')) throw new BadRequestException('Tambahkan minimal satu penanda tangan');
     if (!htmlToText(d.bodyHtml)) throw new BadRequestException('Isi naskah masih kosong');
 
+    const type = await this.naskahType();
+    if (!type.enabled) throw new BadRequestException('Tipe request "Naskah Dinas" sedang dinonaktifkan admin');
+    const priority: Priority = input.priority ?? d.request?.priority ?? 'med';
+    const dueDate = input.dueDate !== undefined ? (input.dueDate ? new Date(input.dueDate) : null) : d.request?.dueDate ?? null;
+    const probe = { id: BigInt(0), typeId: type.id, departmentId: user.departmentId, priority, amount: null, requesterUserId: user.id };
+    const flow = await this.approvals.matchFlow(probe);
+    if (!flow || !this.approvals.buildPlan(flow.levels, probe).length) {
+      throw new BadRequestException('Belum ada alur approval aktif untuk Naskah Dinas. Minta admin mengaturnya di Administrasi → Alur approval.');
+    }
+
+    const prev = { status: d.status, submittedAt: d.submittedAt };
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         await this.prisma.$transaction(async (tx) => {
           await this.assignNumber(tx, d);
-          await tx.eDocumentSigner.updateMany({
-            where: { documentId: id },
-            data: { status: 'waiting', token: null, signatureHmac: null, contentHash: null, signedAt: null, comment: null, ipAddress: null },
-          });
-          const first = d.signers[0];
-          await tx.eDocumentSigner.update({ where: { id: first.id }, data: { status: 'pending' } });
+          // putaran baru: QR putaran sebelumnya (bila pernah ditolak) tidak berlaku lagi
+          await tx.eDocumentSigner.deleteMany({ where: { documentId: id } });
           await tx.eDocument.update({ where: { id }, data: { status: 'signing', submittedAt: new Date(), completedAt: null, contentHash: null, fileId: null } });
           await this.log(id, user.id, d.status === 'rejected' ? 'resubmitted' : 'submitted', null, tx);
         });
@@ -315,10 +419,82 @@ export class EDocumentsService {
     }
     // hash isi setelah nomor terbit (nomor ikut ditandatangani)
     const fresh = await this.load(id);
-    await this.prisma.eDocument.update({ where: { id }, data: { contentHash: this.hashContent(fresh) } });
-    await this.audit.log({ actorUserId: user.id, module: 'edoc', action: 'edoc_submitted', entityType: 'e_document', entityId: id, payload: { number: fresh.number }, ip });
-    await this.notifyPending(id, user.fullName);
+
+    // request approval: pakai ulang request yang ditolak/draft, selain itu buat baru
+    const title = `${fresh.number ? fresh.number + ' — ' : ''}${fresh.title}`.slice(0, 200);
+    const description = [
+      `Naskah dinas${fresh.template ? ` (${fresh.template.name})` : ''}: ${fresh.subject ?? fresh.title}`,
+      fresh.recipient ? `Kepada: ${fresh.recipient}` : null,
+      `Nomor: ${fresh.number ?? '-'}`,
+      'Persetujuan pada request ini menerbitkan QR paraf (level awal) dan QR tanda tangan (level terakhir) pada naskah.',
+    ].filter(Boolean).join('\n');
+    let requestId = fresh.requestId;
+    try {
+      const linked = requestId ? await this.prisma.request.findUnique({ where: { id: requestId } }) : null;
+      if (linked && !linked.deletedAt && ['draft', 'rejected'].includes(linked.status)) {
+        await this.prisma.request.update({ where: { id: linked.id }, data: { title, description, priority, dueDate } });
+      } else {
+        const r = await this.requests.create(user, { title, description, typeId: type.id.toString(), priority, dueDate: dueDate?.toISOString(), submit: false }, ip, { internal: true });
+        requestId = r.id;
+        await this.prisma.eDocument.update({ where: { id }, data: { requestId } });
+      }
+      // hash ulang bila request baru saja ditautkan (hash naskah via approval tidak memuat daftar penanda tangan)
+      const linkedDoc = await this.load(id);
+      await this.prisma.eDocument.update({ where: { id }, data: { contentHash: this.hashContent(linkedDoc) } });
+      await this.requests.submit(user, requestId!, ip, { internal: true });
+      const after = await this.prisma.request.findUniqueOrThrow({ where: { id: requestId! } });
+      if (after.status !== 'pending_approval') throw new BadRequestException('Alur approval Naskah Dinas tidak dapat dimulai. Hubungi admin.');
+    } catch (e) {
+      // kembalikan naskah agar dapat diperbaiki & dikirim ulang
+      await this.prisma.eDocument.update({ where: { id }, data: { status: prev.status, submittedAt: prev.submittedAt, contentHash: null } });
+      if (requestId) await this.prisma.request.updateMany({ where: { id: requestId, status: 'submitted' }, data: { status: 'draft' } });
+      await this.log(id, user.id, 'submit_failed', (e as Error).message);
+      throw e;
+    }
+    await this.audit.log({ actorUserId: user.id, module: 'edoc', action: 'edoc_submitted', entityType: 'e_document', entityId: id, payload: { number: fresh.number, requestId }, ip });
     return this.detail(user, id);
+  }
+
+  // ───────── Pengait approval: setiap level yang menyetujui → QR ─────────
+
+  async onApproved(tx: Tx, ctx: DecisionContext) {
+    const d = await tx.eDocument.findFirst({ where: { requestId: ctx.requestId, deletedAt: null }, include: detailInclude });
+    if (!d) return;
+    if (d.status !== 'signing') throw new ConflictException('Naskah tidak sedang menunggu persetujuan');
+    if (!d.contentHash || this.hashContent(d) !== d.contentHash) throw new ConflictException('Isi naskah berubah sejak dikirim. Tolak request ini agar pembuat mengirim ulang.');
+    const account = await tx.user.findUniqueOrThrow({ where: { id: ctx.userId }, select: { position: true } });
+    const delegator = ctx.onBehalfOf ? await tx.user.findUnique({ where: { id: ctx.onBehalfOf }, select: { fullName: true, position: true } }) : null;
+    const role: SignerRole = ctx.isFinal ? 'sign' : 'paraf';
+    const order = ctx.levelIndex + 1;
+    const token = randomBytes(18).toString('base64url');
+    await tx.eDocumentSigner.deleteMany({ where: { documentId: d.id, order } });
+    await tx.eDocumentSigner.create({
+      data: {
+        documentId: d.id, userId: ctx.userId, order, role, status: 'signed', token, signedAt: ctx.at, contentHash: d.contentHash,
+        ipAddress: ctx.ip ?? null, comment: ctx.comment, positionTitle: account.position, levelName: ctx.levelName.slice(0, 120),
+        onBehalfOf: delegator ? `${delegator.fullName}${delegator.position ? ', ' + delegator.position : ''}`.slice(0, 150) : null,
+        signatureHmac: this.hmac(token, d.id, ctx.userId, d.contentHash, ctx.at),
+      },
+    });
+    if (ctx.isFinal) await tx.eDocument.update({ where: { id: d.id }, data: { status: 'signed', completedAt: ctx.at } });
+    await this.log(d.id, ctx.userId, role === 'paraf' ? 'paraf' : 'signed', `${ctx.levelName}${ctx.comment ? ': ' + ctx.comment : ''}`, tx);
+    await this.audit.log({
+      actorUserId: ctx.userId, module: 'edoc', action: `edoc_${role === 'paraf' ? 'paraf' : 'signed'}`, entityType: 'e_document', entityId: d.id,
+      payload: { number: d.number, level: ctx.levelName, requestId: ctx.requestId, contentHash: d.contentHash }, ip: ctx.ip,
+    }, tx);
+  }
+
+  async onRejected(tx: Tx, ctx: DecisionContext) {
+    const d = await tx.eDocument.findFirst({ where: { requestId: ctx.requestId, deletedAt: null }, select: { id: true, status: true } });
+    if (!d || d.status !== 'signing') return;
+    await tx.eDocument.update({ where: { id: d.id }, data: { status: 'rejected' } });
+    await this.log(d.id, ctx.userId, 'rejected', `${ctx.levelName}: ${ctx.comment ?? ''}`, tx);
+  }
+
+  async afterDecision(ctx: DecisionContext & { decision: string }) {
+    if (ctx.decision !== 'approve' || !ctx.isFinal) return;
+    const d = await this.prisma.eDocument.findFirst({ where: { requestId: ctx.requestId, deletedAt: null, status: 'signed' }, select: { id: true } });
+    if (d) await this.finalize(d.id);
   }
 
   private async notifyPending(id: bigint, actorName: string) {
@@ -340,6 +516,7 @@ export class EDocumentsService {
       throw new UnauthorizedException('Kata sandi salah — tanda tangan dibatalkan');
     }
     const d = await this.load(id);
+    if (d.requestId) throw new BadRequestException('Naskah ini disetujui lewat approval (Setujui + kata sandi)');
     const me = d.signers.find((s) => s.userId === user.id);
     if (d.status !== 'signing' || !me || me.status !== 'pending') throw new ForbiddenException('Belum giliran Anda atau naskah tidak sedang menunggu tanda tangan');
     if (!d.contentHash || this.hashContent(d) !== d.contentHash) throw new ConflictException('Isi naskah berubah sejak dikirim. Hubungi pembuat.');
@@ -389,6 +566,7 @@ export class EDocumentsService {
   async reject(user: AuthUser, id: bigint, reason: string, ip?: string) {
     if (!reason?.trim() || reason.trim().length < 5) throw new BadRequestException('Tuliskan alasan minimal 5 karakter');
     const d = await this.load(id);
+    if (d.requestId) throw new BadRequestException('Naskah ini dikembalikan lewat tombol Tolak pada approval');
     const me = d.signers.find((s) => s.userId === user.id);
     if (d.status !== 'signing' || !me || me.status !== 'pending') throw new ForbiddenException('Belum giliran Anda');
     await this.prisma.$transaction(async (tx) => {
@@ -403,6 +581,7 @@ export class EDocumentsService {
 
   async cancel(user: AuthUser, id: bigint) {
     const d = await this.load(id);
+    if (d.requestId) throw new BadRequestException('Naskah yang sedang dalam approval tidak dapat ditarik. Minta approver menolak agar dapat direvisi.');
     if (d.creatorUserId !== user.id || d.status !== 'signing') throw new ForbiddenException('Hanya pembuat yang dapat menarik naskah yang sedang ditandatangani');
     await this.prisma.$transaction(async (tx) => {
       await tx.eDocument.update({ where: { id }, data: { status: 'draft' } });
@@ -414,21 +593,60 @@ export class EDocumentsService {
 
   // ───────── PDF ─────────
 
+  /** Kotak paraf/tanda tangan yang belum terisi: level approval yang belum menyetujui (beserta approver yang dituju). */
+  private async plannedSigners(d: DocFull): Promise<{ order: number; role: SignerRole; levelName: string; approverName: string | null }[]> {
+    if (this.isLegacy(d) || d.status === 'signed') return [];
+    let levels: PlanLevel[] = [];
+    let names: (string | null)[] = [];
+    const inst = d.status === 'signing' && d.requestId
+      ? await this.prisma.approvalInstance.findFirst({ where: { requestId: d.requestId, status: 'in_progress' }, orderBy: { id: 'desc' }, include: { request: true } })
+      : null;
+    if (inst) {
+      levels = inst.planJson as unknown as PlanLevel[];
+      names = await Promise.all(levels.map(async (l) => {
+        const ids = await this.approvals.baseApprovers(l, inst.request);
+        return ids.length ? (await this.prisma.user.findUnique({ where: { id: ids[0] }, select: { fullName: true } }))?.fullName ?? null : null;
+      }));
+    } else {
+      // belum dikirim / dikembalikan: pratinjau alur yang akan dipakai
+      const type = await this.prisma.requestType.findUnique({ where: { code: NASKAH_TYPE_CODE } });
+      if (!type) return [];
+      const pv = await this.approvals.preview({
+        typeId: type.id.toString(), departmentId: d.departmentId?.toString(), priority: d.request?.priority ?? 'med', requesterUserId: d.creatorUserId.toString(),
+      });
+      levels = pv.levels;
+      names = pv.levels.map((l) => l.approvers[0]?.fullName ?? null);
+    }
+    const signedOrders = new Set(d.status === 'signing' ? d.signers.filter((s) => s.status === 'signed').map((s) => s.order) : []);
+    return levels
+      .map((l, i) => ({ order: i + 1, role: (i === levels.length - 1 ? 'sign' : 'paraf') as SignerRole, levelName: l.name, approverName: names[i] }))
+      .filter((p) => !signedOrders.has(p.order));
+  }
+
   async buildPdf(d: DocFull, draft: boolean) {
+    const legacy = this.isLegacy(d);
+    const signed = legacy || d.status === 'signing' || d.status === 'signed' ? d.signers : [];
+    const rows: PdfSigner[] = signed
+      .filter((s) => legacy || s.status === 'signed')
+      .map((s) => ({
+        order: s.order, role: s.role, status: s.status, name: s.user.fullName,
+        position: s.onBehalfOf ? `a.n. ${s.onBehalfOf}` : s.positionTitle ?? s.user.position,
+        token: s.token, signedAt: s.signedAt,
+      }));
+    const planned = (await this.plannedSigners(d)).map((p) => ({
+      order: p.order, role: p.role, status: 'waiting', name: p.approverName ?? `(${p.levelName})`, position: p.levelName, token: null, signedAt: null,
+    }));
     return this.pdf.render({
       number: d.number, title: d.title, subject: d.subject, recipient: d.recipient, attachmentNote: d.attachmentNote,
       place: d.place, docDate: d.docDate, departmentName: d.department?.name ?? null, contentHash: d.contentHash,
       bodyHtml: this.renderedBody(d), draft,
-      signers: d.signers.map((s) => ({
-        order: s.order, role: s.role, status: s.status, name: s.user.fullName, position: s.positionTitle ?? s.user.position,
-        token: s.token, signedAt: s.signedAt,
-      })),
+      signers: [...rows, ...planned].sort((a, b) => a.order - b.order),
     });
   }
 
   async pdfFor(user: AuthUser, id: bigint) {
     const d = await this.load(id);
-    if (!this.canView(user, d)) throw new ForbiddenException('Anda tidak memiliki akses ke naskah ini');
+    if (!(await this.canView(user, d))) throw new ForbiddenException('Anda tidak memiliki akses ke naskah ini');
     if (d.status === 'signed' && d.fileId) return { fileId: d.fileId, buffer: null as Buffer | null, name: d.file?.originalName ?? 'naskah.pdf' };
     const buffer = await this.buildPdf(d, true);
     return { fileId: null, buffer, name: `DRAF-${d.title.replace(/[^\w\- ]+/g, '').slice(0, 80)}.pdf` };

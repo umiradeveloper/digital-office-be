@@ -1,3 +1,4 @@
+import 'dotenv/config';
 /**
  * Seed data uji Digital Office (PRD 18.1): departemen, role, alur approval, 500 dokumen uji, request contoh.
  * Jalankan: npm run db:seed   (SEED_DOCS=500 dapat diubah)
@@ -196,6 +197,12 @@ async function main() {
   const fDoc = await flow({ name: 'Persetujuan Dokumen & Rundown', code: 'DOK-STD', triggerTypeId: tDoc.id, description: 'Kepala unit, lalu Direktur bila kritis' }, [
     { name: 'Kepala Unit', approverType: 'dept_head', sameDeptOnly: true, slaHours: 24 },
     { name: 'Direktur (kritis)', approverType: 'role', approverRoleId: roles['Direktur'], sameDeptOnly: true, slaHours: 48, conditionJson: { min_priority: 'crit' } },
+  ]);
+  // Naskah dinas: dikirim dari menu Naskah dinas → request tipe NSK. Level awal = QR paraf, level terakhir = QR tanda tangan.
+  const tNsk = await prisma.requestType.create({ data: { name: 'Naskah Dinas', code: 'NSK', category: 'naskah', description: 'Persetujuan, paraf & tanda tangan QR naskah dinas — dibuat dari menu Naskah dinas', customFieldsJson: [] } });
+  await flow({ name: 'Naskah Dinas', code: 'NASKAH-DINAS', triggerTypeId: tNsk.id, description: 'Paraf Team Lead, lalu tanda tangan Manajer unit pembuat' }, [
+    { ...L1, name: 'Paraf · Team Lead' },
+    { ...L2, name: 'Tanda tangan · Manajer' },
   ]);
   await flow({ name: 'Follow-up Operasional', code: 'FUP-OPS', triggerTypeId: tFup.id, departmentId: ops.id, description: 'Replika khusus unit Operasional' }, [{ ...L1, name: 'Team Lead OPS' }]);
   await flow({ name: 'Follow-up Keuangan (draf)', code: 'FUP-KEU', triggerTypeId: tFup.id, departmentId: keu.id, status: 'draft' }, [{ ...L2, name: 'Manajer KEU' }]);
@@ -411,10 +418,6 @@ async function main() {
       bodyHtml: tplDefs[1].bodyHtml.replace('[hari], [tanggal]', 'Senin, 2 November 2026'),
     },
   });
-  await prisma.eDocumentSigner.createMany({ data: [
-    { documentId: draft1.id, userId: U.leadKeu, order: 1, role: 'paraf' },
-    { documentId: draft1.id, userId: U.mgrKeu, order: 2, role: 'sign' },
-  ] });
   await prisma.eDocumentLog.create({ data: { documentId: draft1.id, actorUserId: U.staffKeu, action: 'created' } });
   const draft2 = await prisma.eDocument.create({
     data: {
@@ -422,10 +425,6 @@ async function main() {
       departmentId: keu.id, creatorUserId: U.staffKeu, bodyHtml: tplDefs[3].bodyHtml.replace('[kegiatan]', 'serah terima 10 unit laptop dari PT Sinar Komputindo'),
     },
   });
-  await prisma.eDocumentSigner.createMany({ data: [
-    { documentId: draft2.id, userId: U.staffKeu, order: 1, role: 'sign' },
-    { documentId: draft2.id, userId: U.mgrKeu, order: 2, role: 'sign' },
-  ] });
   await prisma.eDocumentLog.create({ data: { documentId: draft2.id, actorUserId: U.staffKeu, action: 'created' } });
 
   // delegasi aktif contoh

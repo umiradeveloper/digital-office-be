@@ -33,6 +33,10 @@ export interface CreateRequestInput {
   attachmentFileIds?: string[]; submit?: boolean;
 }
 
+/** Kategori tipe request untuk naskah dinas — dibuat & dikirim hanya lewat modul Naskah dinas. */
+export const NASKAH_CATEGORY = 'naskah';
+const NASKAH_ONLY = 'Request naskah dinas dibuat dan dikirim dari menu Naskah dinas';
+
 const listInclude = {
   type: { select: { id: true, name: true, code: true, category: true } },
   requester: { select: { id: true, fullName: true, photoUrl: true, departmentId: true } },
@@ -161,10 +165,11 @@ export class RequestsService implements OnModuleInit {
     return prefix + String(n).padStart(4, '0');
   }
 
-  async create(user: AuthUser, dto: CreateRequestInput, ip?: string) {
-    await this.denyIfReadOnly(user, 'create');
+  async create(user: AuthUser, dto: CreateRequestInput, ip?: string, opts: { internal?: boolean } = {}) {
+    if (!opts.internal) await this.denyIfReadOnly(user, 'create');
     const type = await this.prisma.requestType.findFirst({ where: { id: BigInt(dto.typeId), enabled: true, deletedAt: null } });
     if (!type) throw new BadRequestException('Tipe request tidak tersedia');
+    if (type.category === NASKAH_CATEGORY && !opts.internal) throw new BadRequestException(NASKAH_ONLY);
     const customValues = this.validateCustom(type.customFieldsJson as unknown as CustomField[], dto.customValues);
     const fileIds = (dto.attachmentFileIds ?? []).map((f) => BigInt(f));
     for (const fid of fileIds) await this.docs.requireAccess(user, fid, 'read');
@@ -198,14 +203,15 @@ export class RequestsService implements OnModuleInit {
         vars: { ref: created.refCode, judul: created.title, aktor: user.fullName, due: created.dueDate?.toLocaleDateString('id-ID') ?? '-' },
       });
     }
-    if (dto.submit !== false) return this.submit(user, created.id, ip);
+    if (dto.submit !== false) return this.submit(user, created.id, ip, opts);
     return this.detail(user, created.id);
   }
 
   // ───────── Submit / re-submit (draft|rejected → submitted → pending-approval) ─────────
 
-  async submit(user: AuthUser, id: bigint, ip?: string) {
+  async submit(user: AuthUser, id: bigint, ip?: string, opts: { internal?: boolean } = {}) {
     const r = await this.getOrThrow(id);
+    if (r.type.category === NASKAH_CATEGORY && !opts.internal) throw new BadRequestException(NASKAH_ONLY);
     if (r.requesterUserId !== user.id && !user.isSuperAdmin) throw new ForbiddenException('Hanya pengaju yang dapat mengirim request');
     if (!['draft', 'rejected'].includes(r.status)) throw new BadRequestException(`Request berstatus ${STATUS_LABEL[r.status]} tidak dapat dikirim`);
     const resubmit = r.status === 'rejected';
@@ -242,6 +248,7 @@ export class RequestsService implements OnModuleInit {
         comments: { where: { deletedAt: null }, orderBy: { createdAt: 'asc' }, include: { user: { select: { id: true, fullName: true, photoUrl: true } } } },
         logs: { orderBy: { createdAt: 'asc' }, include: { actor: { select: { id: true, fullName: true, photoUrl: true } } } },
         instances: { orderBy: { id: 'desc' }, select: { id: true, status: true, startedAt: true, finishedAt: true } },
+        eDocument: { select: { id: true, number: true, title: true, subject: true, status: true, deletedAt: true } },
       },
     });
     if (!r) throw new NotFoundException('Request tidak ditemukan');
@@ -257,19 +264,25 @@ export class RequestsService implements OnModuleInit {
     const myTurn = approval?.status === 'in_progress'
       ? approval.levels.find((l) => l.state === 'current')?.currentApprovers.some((a) => a.id === user.id) ?? false
       : false;
+    const naskah = r.type.category === NASKAH_CATEGORY;
+    const eDocument = r.eDocument && !r.eDocument.deletedAt ? r.eDocument : null;
     return {
       ...r,
+      eDocument,
       statusCode: STATUS_API[r.status],
       approval,
+      // naskah dinas: persetujuan menerbitkan QR → wajib kata sandi
+      requiresPassword: !!eDocument,
       permissions: {
-        canEdit: !readOnly && (isRequester || manage) && ['draft', 'rejected'].includes(r.status),
-        canSubmit: !readOnly && isRequester && ['draft', 'rejected'].includes(r.status),
+        // isi request naskah diubah/dikirim ulang lewat halaman naskah
+        canEdit: !naskah && !readOnly && (isRequester || manage) && ['draft', 'rejected'].includes(r.status),
+        canSubmit: !naskah && !readOnly && isRequester && ['draft', 'rejected'].includes(r.status),
         canChangeStatus: !readOnly && (isAssignee || isRequester || manage) ? MANUAL_TRANSITIONS[r.status] ?? [] : [],
         canClose: !readOnly && (isRequester || manage) && !['closed', 'pending_approval', 'draft'].includes(r.status),
         canComment: !readOnly,
         canRemind: !readOnly && ['pending_approval', 'submitted', 'in_progress'].includes(r.status),
         canDecide: myTurn && can(user, 'APPROVAL_DECIDE'),
-        canDelete: !readOnly && isRequester && r.status === 'draft',
+        canDelete: !naskah && !readOnly && isRequester && r.status === 'draft',
       },
     };
   }

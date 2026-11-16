@@ -1,4 +1,5 @@
-import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException, UnauthorizedException } from '@nestjs/common';
+import * as bcrypt from 'bcryptjs';
 import { ApprovalFlow, ApprovalLevel, Prisma, Priority, Request } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuditService } from '../audit/audit.service';
@@ -29,6 +30,32 @@ type Tx = Prisma.TransactionClient;
 
 export const PRIORITY_LABEL: Record<string, string> = { low: 'Rendah', med: 'Sedang', high: 'Tinggi', crit: 'Kritis' };
 
+/** Konteks satu keputusan approval yang diteruskan ke modul lain (mis. naskah dinas → QR per level). */
+export interface DecisionContext {
+  requestId: bigint;
+  instanceId: bigint;
+  levelOrder: number;
+  levelName: string;
+  levelIndex: number; // 0-based posisi level dalam plan
+  totalLevels: number;
+  isFinal: boolean; // approve pada level terakhir
+  userId: bigint; // yang memutuskan
+  onBehalfOf: bigint | null; // delegator bila diputuskan delegat
+  at: Date;
+  comment: string | null;
+  ip?: string;
+}
+
+/**
+ * Pengait keputusan approval. onApproved/onRejected berjalan DI DALAM transaksi keputusan
+ * (lempar error → keputusan dibatalkan); afterDecision berjalan setelah commit.
+ */
+export interface ApprovalHook {
+  onApproved?(tx: Tx, ctx: DecisionContext): Promise<void>;
+  onRejected?(tx: Tx, ctx: DecisionContext): Promise<void>;
+  afterDecision?(ctx: DecisionContext & { decision: 'approve' | 'reject' | 'delegate' }): Promise<void>;
+}
+
 @Injectable()
 export class ApprovalsService {
   constructor(
@@ -36,6 +63,15 @@ export class ApprovalsService {
     private audit: AuditService,
     private notif: NotificationsService,
   ) {}
+
+  private hooks: ApprovalHook[] = [];
+  registerHook(h: ApprovalHook) { this.hooks.push(h); }
+
+  /** Request yang terhubung ke naskah dinas: persetujuan = paraf/tanda tangan → wajib kata sandi. */
+  async linkedDocumentId(requestId: bigint) {
+    const d = await this.prisma.eDocument.findFirst({ where: { requestId, deletedAt: null }, select: { id: true } });
+    return d?.id ?? null;
+  }
 
   // ─────────────────── Routing (BR-05, FR-APR-03) ───────────────────
 
@@ -210,8 +246,9 @@ export class ApprovalsService {
         request: {
           include: {
             requester: { select: { id: true, fullName: true, photoUrl: true } },
-            type: { select: { id: true, name: true } },
+            type: { select: { id: true, name: true, category: true } },
             attachments: { select: { id: true } },
+            eDocument: { select: { id: true, number: true, deletedAt: true } },
           },
         },
       },
@@ -233,6 +270,11 @@ export class ApprovalsService {
         levelStartedAt: inst.levelStartedAt, slaDue, slaBreached: slaDue < new Date(),
         onBehalfOf: mine.onBehalfOf ? { id: mine.onBehalfOf, fullName: onBehalfOfName } : null,
         canDelegate: level.delegateOn,
+        // naskah dinas: persetujuan menerbitkan QR paraf/tanda tangan → wajib kata sandi
+        requiresPassword: !!inst.request.eDocument && !inst.request.eDocument.deletedAt,
+        eDocument: inst.request.eDocument && !inst.request.eDocument.deletedAt
+          ? { id: inst.request.eDocument.id, number: inst.request.eDocument.number, role: plan.findIndex((p) => p.levelOrder === level.levelOrder) === plan.length - 1 ? 'sign' : 'paraf' }
+          : null,
         request: {
           id: inst.request.id, refCode: inst.request.refCode, title: inst.request.title, priority: inst.request.priority,
           dueDate: inst.request.dueDate, amount: inst.request.amount, submittedAt: inst.request.submittedAt,
@@ -265,7 +307,7 @@ export class ApprovalsService {
 
   // ─────────────────── Keputusan (FR-APR-04/05/07, BR-02/03/04) ───────────────────
 
-  async decide(user: AuthUser, instanceId: bigint, dto: { decision: 'approve' | 'reject' | 'delegate'; comment?: string; toUserId?: string }, ip?: string) {
+  async decide(user: AuthUser, instanceId: bigint, dto: { decision: 'approve' | 'reject' | 'delegate'; comment?: string; toUserId?: string; password?: string }, ip?: string) {
     if (!can(user, 'APPROVAL_DECIDE')) {
       await this.audit.log({ actorUserId: user.id, module: 'security', action: 'access_denied', entityType: 'approval_instance', entityId: instanceId, payload: { reason: 'no APPROVAL_DECIDE' }, ip });
       throw new ForbiddenException('Peran Anda tidak dapat memberikan keputusan approval');
@@ -284,6 +326,16 @@ export class ApprovalsService {
     }
     if (dto.decision === 'reject' && !dto.comment?.trim()) throw new BadRequestException('Alasan penolakan wajib diisi');
 
+    // Naskah dinas: menyetujui = membubuhkan paraf/tanda tangan QR → konfirmasi kata sandi
+    if (dto.decision === 'approve' && (await this.linkedDocumentId(inst.requestId))) {
+      const account = await this.prisma.user.findUniqueOrThrow({ where: { id: user.id }, select: { passwordHash: true } });
+      const ok = !!dto.password && (await bcrypt.compare(dto.password, account.passwordHash.replace(/^\$2y\$/, () => '$2b$')));
+      if (!ok) {
+        await this.audit.log({ actorUserId: user.id, module: 'approval', action: 'decision_password_failed', entityType: 'approval_instance', entityId: instanceId, payload: { requestId: inst.requestId }, ip });
+        throw new UnauthorizedException(dto.password ? 'Kata sandi salah — persetujuan dibatalkan' : 'Masukkan kata sandi untuk menyetujui naskah dinas');
+      }
+    }
+
     const r = inst.request;
     const plan = inst.planJson as unknown as PlanLevel[];
     const idx = plan.findIndex((p) => p.levelOrder === inst.currentLevel);
@@ -291,6 +343,10 @@ export class ApprovalsService {
     const now = new Date();
     const vars = { ref: r.refCode, judul: r.title, aktor: user.fullName, level: level.name, alasan: dto.comment ?? '', prioritas: PRIORITY_LABEL[r.priority] };
     let delegateTo: bigint | null = null;
+    const ctx: DecisionContext = {
+      requestId: r.id, instanceId: inst.id, levelOrder: inst.currentLevel, levelName: level.name, levelIndex: idx, totalLevels: plan.length,
+      isFinal: dto.decision === 'approve' && !next, userId: user.id, onBehalfOf: me.onBehalfOf, at: now, comment: dto.comment?.trim() || null, ip,
+    };
 
     if (dto.decision === 'delegate') {
       if (!level.delegateOn) throw new BadRequestException('Level ini tidak mengizinkan delegasi');
@@ -335,6 +391,10 @@ export class ApprovalsService {
         const target = await tx.user.findUnique({ where: { id: delegateTo! }, select: { fullName: true } });
         await tx.requestLog.create({ data: { requestId: r.id, actorUserId: user.id, action: 'delegated', fromStatus: 'pending-approval', toStatus: 'pending-approval', comment: `${level.name} didelegasikan ke ${target?.fullName}${dto.comment ? ': ' + dto.comment : ''}` } });
       }
+      for (const h of this.hooks) {
+        if (dto.decision === 'approve' && h.onApproved) await h.onApproved(tx, ctx);
+        if (dto.decision === 'reject' && h.onRejected) await h.onRejected(tx, ctx);
+      }
       await this.audit.log({
         actorUserId: user.id, module: 'approval', action: `decision_${dto.decision}`, entityType: 'approval_instance', entityId: inst.id,
         payload: { requestId: r.id, ref: r.refCode, level: inst.currentLevel, onBehalfOf: me.onBehalfOf, comment: dto.comment, delegatedTo: delegateTo }, ip,
@@ -352,6 +412,10 @@ export class ApprovalsService {
         requestId: r.id, path: `/approvals?focus=${inst.id}`,
         vars: { ...vars, delegator: user.fullName, periode: `Untuk request ${r.refCode} pada ${level.name}.` },
       });
+    }
+    for (const h of this.hooks) {
+      // kegagalan pasca-commit (mis. pembuatan PDF) tidak membatalkan keputusan yang sudah tersimpan
+      if (h.afterDecision) await h.afterDecision({ ...ctx, decision: dto.decision }).catch((e) => console.error('[approval hook]', e));
     }
     return this.detail(inst.id);
   }

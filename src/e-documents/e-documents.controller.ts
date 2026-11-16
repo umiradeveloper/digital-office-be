@@ -41,6 +41,10 @@ class SignDto {
   @IsString() @MinLength(1, { message: 'Masukkan kata sandi untuk menandatangani' }) password: string;
   @IsOptional() @IsString() @MaxLength(1000) comment?: string;
 }
+class SubmitDto {
+  @IsOptional() @IsIn(['low', 'med', 'high', 'crit'], { message: 'Prioritas tidak valid' }) priority?: 'low' | 'med' | 'high' | 'crit';
+  @IsOptional() @IsString() dueDate?: string | null;
+}
 class RejectDto { @IsString() @MinLength(5, { message: 'Alasan minimal 5 karakter' }) @MaxLength(2000) reason: string; }
 
 class TemplateDto {
@@ -81,7 +85,10 @@ export class EDocumentsController {
   @Delete(':id') remove(@CurrentUser() u: AuthUser, @Param('id') id: string) { return this.edocs.remove(u, toBigInt(id)); }
 
   @Post(':id/submit') @HttpCode(200)
-  submit(@CurrentUser() u: AuthUser, @Param('id') id: string, @ClientIp() ip: string) { return this.edocs.submit(u, toBigInt(id), ip); }
+  submit(@CurrentUser() u: AuthUser, @Param('id') id: string, @Body() dto: SubmitDto, @ClientIp() ip: string) {
+    if (dto.dueDate && isNaN(new Date(dto.dueDate).getTime())) throw new BadRequestException('Batas waktu tidak valid');
+    return this.edocs.submit(u, toBigInt(id), dto, ip);
+  }
 
   /** Tanda tangan/paraf: wajib konfirmasi kata sandi. */
   @Post(':id/sign') @HttpCode(200) @Throttle({ default: { limit: 10, ttl: 60_000 } })

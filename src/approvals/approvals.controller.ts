@@ -1,6 +1,7 @@
 import { Body, Controller, ForbiddenException, Get, HttpCode, Param, Post } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { RequestsService } from '../requests/requests.service';
+import { Throttle } from '@nestjs/throttler';
 import { IsEnum, IsOptional, IsString, MaxLength } from 'class-validator';
 import { ApprovalsService } from './approvals.service';
 import { ClientIp, CurrentUser } from '../common/decorators';
@@ -11,6 +12,8 @@ class DecideDto {
   @IsEnum(['approve', 'reject', 'delegate'], { message: 'Keputusan tidak valid' }) decision: 'approve' | 'reject' | 'delegate';
   @IsOptional() @IsString() @MaxLength(2000) comment?: string;
   @IsOptional() @IsString() toUserId?: string;
+  /** Wajib saat menyetujui request naskah dinas (paraf/tanda tangan QR). */
+  @IsOptional() @IsString() @MaxLength(200) password?: string;
 }
 
 @Controller('approvals')
@@ -27,7 +30,7 @@ export class ApprovalsController {
   }
 
   /** RBAC dicek di service agar penolakan tercatat di audit (UAT-10). */
-  @Post(':instanceId/decide') @HttpCode(200)
+  @Post(':instanceId/decide') @HttpCode(200) @Throttle({ default: { limit: 20, ttl: 60_000 } })
   decide(@Param('instanceId') id: string, @Body() dto: DecideDto, @CurrentUser() u: AuthUser, @ClientIp() ip: string) {
     return this.approvals.decide(u, toBigInt(id), dto, ip);
   }
